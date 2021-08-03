@@ -177,6 +177,24 @@ namespace Execution
         else if (consoleArguments[0] == "-sf")
         {
             generationConfig->executionMode = ExecutionMode::StructureFactorCalculation;
+            if (consoleArguments.size() > 1)
+            {
+                generationConfig->particlesToKeepForStructureFactor = Utilities::ParseInt(consoleArguments[1]);
+
+                generationConfig->keepSmallParticlesForStructureFactor.hasValue = true;
+                generationConfig->keepSmallParticlesForStructureFactor.value = true;
+
+                if (generationConfig->particlesToKeepForStructureFactor < 0)
+                {
+                    generationConfig->particlesToKeepForStructureFactor = -generationConfig->particlesToKeepForStructureFactor;
+                    generationConfig->keepSmallParticlesForStructureFactor.value = false;
+                }
+            }
+            else
+            {
+                generationConfig->particlesToKeepForStructureFactor = -1;
+                generationConfig->keepSmallParticlesForStructureFactor.hasValue = false;
+            }
         }
         // LocalOrientationalDisorder
         else if (consoleArguments[0] == "-lod")
@@ -207,6 +225,10 @@ namespace Execution
             {
                 generationConfig->insertionRadiiCount = -1;
             }
+        }
+        else if (consoleArguments[0] == "-permprob")
+        {
+            generationConfig->executionMode = ExecutionMode::SuccessfulPermutationProbability;
         }
         else
         {

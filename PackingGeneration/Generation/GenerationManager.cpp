@@ -164,6 +164,11 @@ namespace Generation
         ExecuteAlgorithm(userConfig, ACTIVE_GEOMETRY_FILE_NAME, true, true, &GenerationManager::CalculateActiveGeometry);
     }
 
+    void GenerationManager::CalculateSuccessfulPermutationProbability(const Model::ExecutionConfig& userConfig)
+    {
+        ExecuteAlgorithm(userConfig, SUCCESSFUL_PERMUTATION_PROBABILITY_FILE_NAME, true, true, &GenerationManager::CalculateSuccessfulPermutationProbability);
+    }
+
     void GenerationManager::ExecuteAlgorithm(const ExecutionConfig& userConfig, string targetFileName,
             bool shouldExitIfTargetFileExists, bool shouldAlwaysReadPacking, Action algorithm)
     {
@@ -274,18 +279,46 @@ namespace Generation
     void GenerationManager::CalculateContactNumberDistribution(const ExecutionConfig& fullConfig, const ModellingContext& context, string targetFilePath, Packing* particles)
     {
         printf("Calculating contact number distributions\n");
+        Packing& packingToUse = *particles;
+
+        // just make sure that the closest pair touches
+        //ClosestPairProvider 
+        distanceService->SetParticles(*particles);
+        ParticlePair closestPair = distanceService->FindClosestPair();
+        FLOAT_TYPE closestNormalizedDistance = std::sqrt(closestPair.normalizedDistanceSquare);
+        printf("Normalized distance of a closest pair is %f\n", closestNormalizedDistance);
+        if (closestNormalizedDistance > 1.0001)
+        {
+            printf("Min normalized distance is too high, parcking was probably not rescaled to the final density. Rescaling before contacts calculation...\n");
+            Packing rescaledParticles = *particles;
+            for (Particle& p : rescaledParticles)
+            {
+                p.diameter *= closestNormalizedDistance;
+            }
+            packingToUse = rescaledParticles;
+        }
 
         FLOAT_TYPE contractionRate = 1.0 - 1e-4;
         vector<int> neighborCounts;
         vector<int> neighborCountFrequencies;
-        contractionEnergyService->SetParticles(*particles);
-        FLOAT_TYPE estimatedCoordinationNumber = insertionRadiiGenerator->GetContactNumberDistribution(*particles, contractionEnergyService,
-                contractionRate, &neighborCounts, &neighborCountFrequencies);
+        vector<vector<int>> touchingParticleIndexes;
+        contractionEnergyService->SetParticles(packingToUse);
+        FLOAT_TYPE estimatedCoordinationNumber = insertionRadiiGenerator->GetContactNumberDistribution(packingToUse, contractionEnergyService,
+                contractionRate, &neighborCounts, &neighborCountFrequencies, &touchingParticleIndexes);
 
         printf("Estimated coordination number is %f\n", estimatedCoordinationNumber);
 
         packingSerializer->SerializeContactNumberDistribution(targetFilePath, neighborCounts, neighborCountFrequencies);
 
+        string targetFolder = Core::Path::GetParentPath(targetFilePath);
+        string contactNumbersFilePath = Core::Path::Append(targetFolder, CONTACTING_NEIGHBORS_FILE_NAME);
+        packingSerializer->SerializeContactingNeighborIndexes(contactNumbersFilePath, touchingParticleIndexes);
+
+        vector<FLOAT_TYPE> normalizedContactingNeighborDistances;
+        insertionRadiiGenerator->FillNormalizedContactingNeighborDistances(packingToUse, touchingParticleIndexes, &normalizedContactingNeighborDistances);
+
+        string contactingNeighborDistancesFilePath = Core::Path::Append(targetFolder, CONTACTING_NEIGHBOR_DISTANCES_FILE_NAME);
+        packingSerializer->SerializeContactingNeighborDistances(contactingNeighborDistancesFilePath, normalizedContactingNeighborDistances);
 
 //        FLOAT_TYPE expectedCoordinationNumber = GetExpectedCoordinationNumber(fullConfig, context, targetFilePath, particles);
 //        // Find the best contraction rate to get this coordination number
@@ -484,9 +517,71 @@ namespace Generation
     {
         printf("Calculating structure factor\n");
 
+        Packing& particlesRef = *particles;
+
+        std::vector<int> particleIndexesOfInterest;
+        if (fullConfig.generationConfig.particlesToKeepForStructureFactor > 0)
+        {
+            int particlesToChooseCount = fullConfig.generationConfig.particlesToKeepForStructureFactor;
+            bool keepSmallest = fullConfig.generationConfig.keepSmallParticlesForStructureFactor.value;
+
+            // choosing that many largest particles
+            // NOTE: maybe use nth element
+            std::vector<double> diameters;
+            for (const DomainParticle& particle : particlesRef)
+            {
+                diameters.push_back(particle.diameter);
+            }
+            std::vector<int> permutation;
+            StlUtilities::SortPermutation(diameters, &permutation);
+
+            if (keepSmallest)
+            {
+                permutation.erase(permutation.begin() + particlesToChooseCount, permutation.end());
+            }
+            else
+            {
+                int particlesToRemove = permutation.size() - particlesToChooseCount;
+                permutation.erase(permutation.begin(), permutation.begin() + particlesToRemove);
+            }
+
+            particleIndexesOfInterest.swap(permutation);
+
+            double minSelectedDiameter = 1000; // TODO: use numeric_limits
+            double maxSelectedDiameter = 0;
+            for (int i : particleIndexesOfInterest)
+            {
+                double diameter = particlesRef[i].diameter;
+                if (diameter > maxSelectedDiameter)
+                {
+                    maxSelectedDiameter = diameter;
+                }
+                if (diameter < minSelectedDiameter)
+                {
+                    minSelectedDiameter = diameter;
+                }
+            }
+
+            if (keepSmallest)
+            {
+                printf("Expected to calculate structure factor for %d smallest particles. Selected %d smallest particles. Max selected diameter: %f\n",
+                    particlesToChooseCount,
+                    particleIndexesOfInterest.size(),
+                    maxSelectedDiameter);
+            }
+            else
+            {
+                printf("Expected to calculate structure factor for %d largest particles. Selected %d largest particles. Min selected diameter: %f\n",
+                    particlesToChooseCount,
+                    particleIndexesOfInterest.size(),
+                    minSelectedDiameter);
+            }
+        }
+
+
         distanceService->SetParticles(*particles);
         StructureFactor structureFactor;
-        distanceService->FillStructureFactor(&structureFactor);
+        distanceService->FillStructureFactor(particleIndexesOfInterest, &structureFactor);
 
         packingSerializer->SerializeStructureFactor(targetFilePath, structureFactor);
     }
@@ -648,6 +743,19 @@ namespace Generation
         }
 
         packingSerializer->SerializeActiveConfig(targetFilePath, activeConfig, shift);
+    }
+
+    void GenerationManager::CalculateSuccessfulPermutationProbability(const Model::ExecutionConfig& fullConfig, const Model::ModellingContext& context, std::string targetFilePath, Model::Packing* particles)
+    {
+        printf("Calculating successful permutation probability\n");
+        Packing& packingToUse = *particles;
+
+        int maxPermutations = 5000;
+        FLOAT_TYPE successfulPermutationProbability = insertionRadiiGenerator->GetSuccessfulPermutationProbability(particles, maxPermutations);
+
+        printf("Estimated successful permutation probability is %f\n", successfulPermutationProbability);
+
+        //packingSerializer->SerializeContactNumberDistribution(targetFilePath, neighborCounts, neighborCountFrequencies);
     }
 
     void GenerationManager::FillContractionRatios(vector<FLOAT_TYPE>* contractionRatios) const

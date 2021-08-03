@@ -136,7 +136,12 @@ namespace PackingServices
         return -negativeContractionRatio;
     }
 
-    FLOAT_TYPE InsertionRadiiGenerator::GetContactNumberDistribution(const Packing& particles, IEnergyService* energyService, FLOAT_TYPE contractionRate, vector<int>* neighborCounts, vector<int>* neighborCountFrequencies) const
+    FLOAT_TYPE InsertionRadiiGenerator::GetContactNumberDistribution(const Packing& particles, 
+        IEnergyService* energyService, 
+        FLOAT_TYPE contractionRate, 
+        vector<int>* neighborCounts, 
+        vector<int>* neighborCountFrequencies,
+        vector<vector<int>>* touchingParticleIndexes) const
     {
         vector<FLOAT_TYPE> contractionRatios(1, contractionRate);
         const HarmonicPotential zeroPotential(0.0);
@@ -148,6 +153,8 @@ namespace PackingServices
         IEnergyService::EnergiesPerParticle& energiesPerParticle = energiesPerParticleVector[0];
         vector<int> neighborCountsPerParticle(energiesPerParticle.contractionEnergiesPerParticle.size());
         VectorUtilities::Round(energiesPerParticle.contractionEnergiesPerParticle, &neighborCountsPerParticle);
+
+        touchingParticleIndexes->swap(energiesPerParticle.touchingNeighborIndexesPerParticle);
 
         int maxNeighborCountPosition = StlUtilities::FindMaxElementPosition(neighborCountsPerParticle);
         int maxNeighborCount = neighborCountsPerParticle[maxNeighborCountPosition];
@@ -177,7 +184,105 @@ namespace PackingServices
         FLOAT_TYPE totalContacts = VectorUtilities::Sum(contacts);
         FLOAT_TYPE nonRattlerCounts = VectorUtilities::Sum(*neighborCountFrequencies);
         FLOAT_TYPE coordinationNumber = totalContacts / nonRattlerCounts;
+
+        // Estimate coordination number from neighbor indexes only
+        int totalContactsFromIndexes = 0;
+        for (const vector<int>& currentParticleNeighborIndexes : *touchingParticleIndexes)
+        {
+            if (currentParticleNeighborIndexes.size() > 0)
+            {
+                totalContactsFromIndexes += currentParticleNeighborIndexes.size();
+            }
+        }
+        FLOAT_TYPE coordinationNumberFromIndexes = (FLOAT_TYPE)totalContactsFromIndexes / nonRattlerCounts;
+
+        printf("Coordination number from contacts historam (possibly with rattlers excluded): %f\n", coordinationNumber);
+        printf("Coordination number from touching indexes (possibly with rattlers excluded): %f\n", coordinationNumberFromIndexes);
+
         return coordinationNumber;
+    }
+
+    // The method will always return zero.
+    // The probability per particle is ~0.5. But the probability per packing is 0.5^N, which is a vanishing number.
+    FLOAT_TYPE InsertionRadiiGenerator::GetSuccessfulPermutationProbability(Packing* particles, int maxAttemptsCount) const
+    {
+        Packing& particlesRef = *particles;
+
+        vector<int> permutation(particles->size());
+        VectorUtilities::FillLinearScale(0, &permutation);
+
+
+        Packing originalPacking = particlesRef; // copy
+
+        distanceProvider->SetParticles(particlesRef);
+        int successfulPermutations = 0;
+
+        for (int permutationIndex = 0; permutationIndex < maxAttemptsCount; permutationIndex++)
+        {
+            StlUtilities::RandomlyShuffle(&permutation);
+
+            //for (size_t particleIndex = 0; particleIndex < particlesRef.size(); particleIndex++)
+            //{
+            //    Particle& currentParticle = particlesRef[particleIndex];
+            //    distanceProvider->StartMove(particleIndex);
+
+            //    int targetParticleIndex = permutation[particleIndex];
+            //    const Particle& targetParticle = originalPacking[targetParticleIndex];
+            //    currentParticle.coordinates = targetParticle.coordinates;
+
+            //    distanceProvider->EndMove();
+            //}
+
+            // for such large moves the stupid method (reinitializing things every time) is actually faster
+            for (size_t particleIndex = 0; particleIndex < particlesRef.size(); particleIndex++)
+            {
+                Particle& currentParticle = particlesRef[particleIndex];
+
+                int targetParticleIndex = permutation[particleIndex];
+                const Particle& targetParticle = originalPacking[targetParticleIndex];
+                currentParticle.coordinates = targetParticle.coordinates;
+            }
+            distanceProvider->SetParticles(particlesRef);
+
+            ParticlePair closestPair = distanceProvider->FindClosestPair();
+            printf("normalizedDistanceSquare: %f\n", closestPair.normalizedDistanceSquare);
+            bool permutationSuccessful = closestPair.normalizedDistanceSquare >= 1.0;
+            if (permutationSuccessful)
+            {
+                successfulPermutations++;
+            }
+            if ((permutationIndex + 1) % 10 == 0)
+            {
+                printf("Permutations done: %d, successful permutations: %d, permutation probability %f\n",
+                    permutationIndex + 1, successfulPermutations, (FLOAT_TYPE)successfulPermutations / (permutationIndex + 1));
+            }
+        }
+        return (FLOAT_TYPE)successfulPermutations / maxAttemptsCount;
+    }
+
+    void InsertionRadiiGenerator::FillNormalizedContactingNeighborDistances(const Packing& particles,
+        const vector<vector<int>>& touchingParticleIndexes,
+        vector<FLOAT_TYPE>* normalizedContactingNeighborDistances) const
+    {
+        std::vector<FLOAT_TYPE>& normalizedContactingNeighborDistancesRef = *normalizedContactingNeighborDistances;
+        normalizedContactingNeighborDistancesRef.clear();
+
+        FLOAT_TYPE meanRadius = geometryService->GetMeanParticleDiameter(particles) * 0.5;
+        FLOAT_TYPE radiusStd = geometryService->GetParticleDiameterStd(particles) * 0.5;
+        printf("Radius mean: %f, radius std: %f, polydispersity: %f", meanRadius, radiusStd, radiusStd / meanRadius);
+
+        for (size_t particleIndex = 0; particleIndex < touchingParticleIndexes.size(); particleIndex++)
+        {
+            const std::vector<int>& currentTouchingIndexes = touchingParticleIndexes[particleIndex];
+            FLOAT_TYPE particleRadius = particles[particleIndex].diameter * 0.5;
+            for (size_t neighborIndex = 0; neighborIndex < currentTouchingIndexes.size(); neighborIndex++)
+            {
+                FLOAT_TYPE neighborRadius = particles[neighborIndex].diameter * 0.5;
+                FLOAT_TYPE distance = (particleRadius + neighborRadius) / meanRadius;
+                normalizedContactingNeighborDistancesRef.push_back(distance);
+            }
+        }
+        Core::StlUtilities::Sort(&normalizedContactingNeighborDistancesRef);
     }
 
     void InsertionRadiiGenerator::FillInsertionRadii(const Packing& particles, int insertionRadiiCount, vector<FLOAT_TYPE>* insertionRadii) const
